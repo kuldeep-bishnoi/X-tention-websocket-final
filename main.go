@@ -49,7 +49,6 @@ const resetInterval = 1 * 60 * 60
 
 func main() {
 	db.InitMongoDB()
-
 	ipConnections = make(map[string]int)
 	channelSubscribers = make(map[string]int)
 
@@ -103,28 +102,33 @@ func main() {
 	r := gin.Default()
 	r.Use(RateLimitMiddleware(10))
 	InitializeRedis()
-	r.GET("/", func(c *gin.Context) {
+	// Create a group for /websocket
+	wsGroup := r.Group("/websocket")
+
+	// Define your WebSocket-related routes under the /websocket group
+	wsGroup.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, "Hello World")
 	})
 
-	r.POST("/addInstrument/:token", func(ctx *gin.Context) {
+	wsGroup.POST("/addInstrument/:token", func(ctx *gin.Context) {
 		addInstrument(ctx)
 	})
 
-	r.DELETE("/removeInstrument/:token", func(ctx *gin.Context) {
+	wsGroup.DELETE("/removeInstrument/:token", func(ctx *gin.Context) {
 		removeInstrument(ctx)
 	})
 
-	r.POST("/updateTokenAndKey", func(ctx *gin.Context) {
+	wsGroup.POST("/updateTokenAndKey", func(ctx *gin.Context) {
 		updateTokenAndKey(ctx)
 	})
 
-	r.GET("/ws", func(ctx *gin.Context) {
+	wsGroup.GET("/ws", func(ctx *gin.Context) {
 		hub.handleConnection(ctx)
 	})
 
-	r.GET("/getInstruments", getInstruments)
+	wsGroup.GET("/getInstruments", getInstruments)
 
+	// Run the Gin server
 	if err := r.Run(serverAddress); err != nil {
 		log.Fatal("Failed to start Gin server: ", err)
 	}
@@ -218,14 +222,13 @@ func (h *Hub) Run() {
 func (h *Hub) handleConnection(c *gin.Context) {
 
 	// Read and verify the PASETO token from the request header
-	token := c.GetHeader("Authorization")
+	token := c.Query("token")
 	if token == "" {
 		// If the token is missing, return an unauthorized response with an error message
 		fmt.Println("Missing token")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing token"})
 		return
 	}
-
 	// Verify the PASETO token
 	if err := verifyPasetoToken(token); err != nil {
 		// If the token is invalid, return an unauthorized response with an error message
