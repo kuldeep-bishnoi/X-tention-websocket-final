@@ -829,7 +829,7 @@ func publishToRedis(quoteData QuoteData) {
 		return
 	}
 
-	log.Printf("Published data to Redis channel %s: %s\n", channelName, jsonData)
+	// log.Printf("Published data to Redis channel %s: %s\n", channelName, jsonData)
 }
 
 type QuoteData struct {
