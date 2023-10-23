@@ -193,7 +193,6 @@ func (h *Hub) Run() {
 					if channelSubscribers[channel] <= 0 {
 						unsubscribeToInstruments(wsConn, []int{intChannel})
 					}
-
 				}
 				close(client.send)
 				delete(h.clients, client)
@@ -355,7 +354,7 @@ func (c *Client) writePump() {
 }
 
 func (c *Client) handleMessage(message string) {
-	ctx := context.Background()
+	// ctx := context.Background()
 	message = strings.TrimSpace(message)
 	if strings.HasPrefix(message, "subscribe:{") && strings.HasSuffix(message, "}") {
 		channelsStr := message[len("subscribe:{") : len(message)-1]
@@ -366,13 +365,19 @@ func (c *Client) handleMessage(message string) {
 		}
 	} else {
 		parts := strings.SplitN(message, " ", 2)
-		if len(parts) != 2 {
+		fmt.Println("parts:", parts, len(parts))
+		if len(parts) < 0 {
 			fmt.Println("Invalid message format:", message)
 			return
 		}
 		channelName := strings.TrimSpace(parts[0])
-		data := parts[1]
-		redisClient.Publish(ctx, channelName, data)
+		c.subscriptions[channelName] = true
+		hub.addSubscription(c, channelName)
+		if wsConn == nil {
+			return
+		}
+		// Increment the subscriber count for the channel
+		channelSubscribers[channelName]++
 	}
 }
 
@@ -389,6 +394,7 @@ func (c *Client) subscribe(channelName string) {
 		fmt.Println("Error checking membership:", err)
 		return
 	}
+	fmt.Println("isMember:", isMember)
 	if !isMember {
 		fmt.Printf("Not allowed to subscribe to channel: %s\n", channelName)
 		return
