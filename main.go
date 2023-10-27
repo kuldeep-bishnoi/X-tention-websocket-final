@@ -63,9 +63,9 @@ func main() {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
-	redisAddr := os.Getenv("REDIS_ADDR")
+	redisAddr := os.Getenv("REDIS_ADDRESS")
 	redisDBStr := os.Getenv("REDIS_DB")
-	serverAddress := os.Getenv("SERVER_ADDRESS")
+	serverAddress := os.Getenv("PORT")
 	fmt.Println("REDIS_ADDR:", redisAddr, "REDIS_DB:", redisDBStr, "SERVER_ADDRESS:", serverAddress)
 
 	// Convert the database number to an integer
@@ -85,8 +85,9 @@ func main() {
 	}
 
 	redisClient = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-		DB:   redisDB,
+		Addr:     redisAddr,
+		Password: "", // No password by default
+		DB:       redisDB,
 	})
 
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
@@ -98,7 +99,7 @@ func main() {
 		fmt.Println("@@@@@@@@@@Failed to connect to Redis:@@@@@@@@@", err)
 		os.Exit(1)
 	}
-
+	fmt.Println("Connected to Redis")
 	r := gin.Default()
 	r.Use(RateLimitMiddleware(10))
 	InitializeRedis()
@@ -129,7 +130,7 @@ func main() {
 	wsGroup.GET("/getInstruments", getInstruments)
 
 	// Run the Gin server
-	if err := r.Run(serverAddress); err != nil {
+	if err := r.Run(":" + serverAddress); err != nil {
 		log.Fatal("Failed to start Gin server: ", err)
 	}
 
@@ -485,6 +486,9 @@ func InitializeRedis() {
 
 	// Start a goroutine to handle incoming messages from Redis
 	go func() {
+		if redisClient == nil {
+			return
+		}
 		// Subscribe to all channels dynamically
 		pubsub := redisClient.PSubscribe(c, "*")
 		// if pubsub != nil {
@@ -551,6 +555,7 @@ func getInstruments(c *gin.Context) {
 		if err != nil {
 			fmt.Println(err)
 		}
+		log.Println("Failed to get instrument tokens from Redis")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get instrument tokens from Redis"})
 		return
 	}
@@ -884,7 +889,9 @@ func parseQuoteData(data []byte) []QuoteData {
 
 func getInstrumentTokensFromRedis() []int {
 	ctx := context.Background()
-
+	if redisClient == nil {
+		return []int{}
+	}
 	tokenStrs, err := redisClient.SMembers(ctx, "instrumentTokens").Result()
 	if err != nil {
 		log.Println("Failed to get instrument tokens from Redis:", err)

@@ -32,14 +32,23 @@ func InitMongoDB() (*mongo.Client, *mongo.Collection) {
 	mongoURI := os.Getenv("MONGO_URI")
 	mongoDatabase := os.Getenv("MONGO_DATABASE")
 	mongoCollection := os.Getenv("MONGO_COLLECTION")
-
+	mongoUsername := os.Getenv("MONGO_USERNAME") // New environment variable
+	mongoPassword := os.Getenv("MONGO_PASSWORD")
+	fmt.Println("mongoURI", mongoURI, "mongoDatabase", mongoDatabase, "mongoCollection", mongoCollection, "mongoUsername", mongoUsername, "mongoPassword", mongoPassword)
 	// Set up client options
 	clientOptions := options.Client().ApplyURI(mongoURI)
+
+	// // Set credentials if username and password are provided
+	// clientOptions := options.Client().ApplyURI(mongoURI)
+	clientOptions.Auth = &options.Credential{
+		Username: mongoUsername,
+		Password: mongoPassword,
+	}
 
 	// Create a new MongoDB client
 	client, err := mongo.Connect(context.Background(), clientOptions)
 	if err != nil {
-		fmt.Println("--------------------Failed to connect to MongoDB--------------------")
+		fmt.Println("Failed to connect to MongoDB:", err)
 		panic("Failed to connect to MongoDB")
 	}
 
