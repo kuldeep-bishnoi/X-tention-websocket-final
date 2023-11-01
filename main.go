@@ -56,9 +56,9 @@ func main() {
 	go hub.Run()
 	if err := godotenv.Load(); err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Error loading .env file "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Error loading .env file "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		log.Fatalf("Error loading .env file: %v", err)
 	}
@@ -75,9 +75,9 @@ func main() {
 		redisDB, err = strconv.Atoi(redisDBStr)
 		if err != nil {
 			_, file, line, _ := runtime.Caller(0) // Get caller info
-			err := db.InsertError("Error parsing Redis DB number from environment "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-			if err != nil {
-				fmt.Println(err)
+			err1 := db.InsertError("Error parsing Redis DB number from environment "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+			if err1 != nil {
+				fmt.Println(err1)
 			}
 			fmt.Println("Invalid Redis DB number:", err)
 			os.Exit(1)
@@ -92,9 +92,9 @@ func main() {
 
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Failed to connect to Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Failed to connect to Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		fmt.Println("@@@@@@@@@@Failed to connect to Redis:@@@@@@@@@", err)
 		os.Exit(1)
@@ -357,8 +357,8 @@ func (c *Client) writePump() {
 func (c *Client) handleMessage(message string) {
 	// ctx := context.Background()
 	message = strings.TrimSpace(message)
-	if strings.HasPrefix(message, "subscribe:{") && strings.HasSuffix(message, "}") {
-		channelsStr := message[len("subscribe:{") : len(message)-1]
+	if strings.HasPrefix(message, "subscribe:[") && strings.HasSuffix(message, "]") {
+		channelsStr := message[len("subscribe:[") : len(message)-1]
 		channels := strings.Split(channelsStr, ",")
 		for _, channelName := range channels {
 			channelName = strings.TrimSpace(channelName)
@@ -388,9 +388,9 @@ func (c *Client) subscribe(channelName string) {
 	isMember, err := redisClient.SIsMember(ctx, "instrumentTokens", channelName).Result()
 	if err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Error in checking instrument token in redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Error in checking instrument token in redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		fmt.Println("Error checking membership:", err)
 		return
@@ -551,9 +551,9 @@ func getInstruments(c *gin.Context) {
 	instrumentTokens := getInstrumentTokensFromRedis()
 	if instrumentTokens == nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		log.Println("Failed to get instrument tokens from Redis")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get instrument tokens from Redis"})
@@ -590,9 +590,9 @@ func updateWebSocketSubscriptions(conn *websocket.Conn) {
 	instrumentTokens := getInstrumentTokensFromRedis()
 	if instrumentTokens == nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		log.Println("Failed to get instrument tokens from Redis")
 		return
@@ -618,9 +618,9 @@ func removeInstrument(c *gin.Context) {
 	if err := redisClient.SRem(ctx, "instrumentTokens", token).Err(); err != nil {
 
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Failed to remove instrument token from Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Failed to remove instrument token from Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 
 		log.Println("Failed to remove instrument token from Redis:", err)
@@ -643,9 +643,9 @@ func unsubscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 		err := wsConn.WriteJSON(setModeMessage)
 		if err != nil {
 			_, file, line, _ := runtime.Caller(0) // Get caller info
-			err := db.InsertError("Failed to unsubscribe to instruments "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-			if err != nil {
-				fmt.Println(err)
+			err1 := db.InsertError("Failed to unsubscribe to instruments "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+			if err1 != nil {
+				fmt.Println(err1)
 			}
 			log.Println("Unsubscribe error:", err)
 		} else {
@@ -702,9 +702,9 @@ func connectToWebSocket() *websocket.Conn {
 	token, err := redisClient.Get(ctx, "zerodha:token").Result()
 	if err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Failed to get token for zerodha from Redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Failed to get token for zerodha from Redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		fmt.Println("Failed to get token from Redis:", err)
 		return nil
@@ -754,9 +754,9 @@ func connectToWebSocket() *websocket.Conn {
 			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 			if err != nil {
 				_, file, line, _ := runtime.Caller(0) // Get caller info
-				err := db.InsertError("Failed to connect to WebSocket: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-				if err != nil {
-					fmt.Println(err)
+				err1 := db.InsertError("Failed to connect to WebSocket: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+				if err1 != nil {
+					fmt.Println(err1)
 				}
 				log.Println("WebSocket connection failed: ", err)
 				return nil
@@ -832,9 +832,9 @@ func publishToRedis(quoteData QuoteData) {
 	err = redisClient.Publish(ctx, channelName, jsonData).Err()
 	if err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Redis publish error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Redis publish error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 		log.Println("Redis publish error: ", err)
 		return
@@ -922,9 +922,9 @@ func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 	err := conn.WriteJSON(subscribeMessage)
 	if err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Subscribe error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err)
+		err1 := db.InsertError("Subscribe error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		if err1 != nil {
+			fmt.Println(err1)
 		}
 
 		log.Fatal("Subscribe error: ", err)
@@ -940,9 +940,9 @@ func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 	err = conn.WriteJSON(setModeMessage)
 	if err != nil {
 		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err := db.InsertError("Set mode error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+		err1 := db.InsertError("Set mode error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println(err1)
 		}
 		log.Fatal("Set mode error: ", err)
 	} else {
