@@ -220,7 +220,6 @@ func (h *Hub) Run() {
 }
 
 func (h *Hub) handleConnection(c *gin.Context) {
-
 	// Read and verify the PASETO token from the request header
 	token := c.Query("token")
 	if token == "" {
@@ -281,7 +280,6 @@ func (c *Client) readPump() {
 	c.conn.SetReadLimit(1024)
 	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
-		// fmt.Println("pong")
 		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
@@ -289,22 +287,69 @@ func (c *Client) readPump() {
 		messageType, p, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				// Handle unexpected close error (e.g., client closed the connection)
 				fmt.Printf("Unexpected close error: %v\n", err)
 			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure) {
-				// Handle normal close error (e.g., client closed the connection)
 				fmt.Printf("Normal close error: %v\n", err)
 			} else {
 				fmt.Printf("WebSocket read error: %v\n", err)
 			}
 			break
 		}
+
 		if messageType == websocket.TextMessage {
-			c.handleMessage(string(p))
+			var messageData map[string]interface{}
+			if err := json.Unmarshal(p, &messageData); err != nil {
+				fmt.Println("Error parsing JSON message:", err)
+			} else {
+				message, ok := messageData["type"].(string)
+				if ok {
+					if message == "subscribe" {
+						c.handleSubscribe(messageData)
+					} else if message == "update" {
+						c.handleUpdate(messageData)
+					} else {
+						// Discard other message types
+						fmt.Println("Discarding unknown message type:", message)
+					}
+				} else {
+					fmt.Println("Message type is missing in the JSON data")
+				}
+			}
 		} else if messageType == websocket.PongMessage {
 			fmt.Println("Pong received, connection is alive")
 		}
 	}
+}
+
+func (c *Client) handleSubscribe(messageData map[string]interface{}) {
+	channels, ok := messageData["channels"].([]interface{})
+	if ok {
+		for _, channel := range channels {
+			if channelName, ok := channel.(float64); ok {
+				channelNamez := int(channelName)
+				c.subscribe(strconv.Itoa(channelNamez))
+			}
+		}
+	}
+}
+
+func (c *Client) handleUpdate(messageData map[string]interface{}) {
+	channel, ok := messageData["channel"]
+	if !ok {
+		return
+	}
+	channelName, ok := channel.(string)
+	if !ok {
+		fmt.Println("Invalid channel name")
+		return
+	}
+	c.subscriptions[channelName] = true
+	hub.addSubscription(c, channelName)
+	if wsConn == nil {
+		return
+	}
+	// Increment the subscriber count for the channel
+	channelSubscribers[channelName]++
 }
 
 func (c *Client) writePump() {
@@ -356,12 +401,16 @@ func (c *Client) writePump() {
 
 func (c *Client) handleMessage(message string) {
 	// ctx := context.Background()
+	fmt.Println("message:", message)
 	message = strings.TrimSpace(message)
 	if strings.HasPrefix(message, "subscribe:[") && strings.HasSuffix(message, "]") {
 		channelsStr := message[len("subscribe:[") : len(message)-1]
 		channels := strings.Split(channelsStr, ",")
 		for _, channelName := range channels {
 			channelName = strings.TrimSpace(channelName)
+			if channelName == "" && len(channels) > 1 {
+				continue
+			}
 			c.subscribe(channelName)
 		}
 	} else {
@@ -383,6 +432,7 @@ func (c *Client) handleMessage(message string) {
 }
 
 func (c *Client) subscribe(channelName string) {
+	fmt.Println("Subscribe called for channel:", channelName)
 	ctx := context.Background()
 	//check in redis if instrument is present or not
 	isMember, err := redisClient.SIsMember(ctx, "instrumentTokens", channelName).Result()
@@ -649,7 +699,7 @@ func unsubscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 			}
 			log.Println("Unsubscribe error:", err)
 		} else {
-			log.Printf("Unsubscribed from instrument: %s\n", instrumentTokens)
+			log.Printf("Unsubscribed from instrument: %v\n", instrumentTokens)
 		}
 	}
 }
