@@ -112,7 +112,7 @@ func main() {
 	})
 
 	wsGroup.POST("/addInstrument/:token", func(ctx *gin.Context) {
-		addInstrument(ctx)
+		addInstruments(ctx)
 	})
 
 	wsGroup.DELETE("/removeInstrument/:token", func(ctx *gin.Context) {
@@ -612,19 +612,23 @@ func getInstruments(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"Instruments": instrumentTokens})
 }
 
-func addInstrument(c *gin.Context) {
-	tokenStr := c.Param("token")
-	token, err := strconv.Atoi(tokenStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid instrument token"})
-		return
+func addInstruments(c *gin.Context) {
+	var request struct {
+		Tokens []int `json:"tokens", binding`
 	}
 
-	ctx := context.Background()
-	if err := redisClient.SAdd(ctx, "instrumentTokens", token).Err(); err != nil {
-		log.Println("Failed to add instrument token to Redis:", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add instrument"})
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
 		return
+	}
+	ctx := context.Background()
+
+	for _, token := range request.Tokens {
+		if err := redisClient.SAdd(ctx, "instrumentTokens", token).Err(); err != nil {
+			log.Println("Failed to add instrument token to Redis:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add instruments"})
+			return
+		}
 	}
 
 	if wsConn == nil {
@@ -633,7 +637,7 @@ func addInstrument(c *gin.Context) {
 		return
 	}
 	updateWebSocketSubscriptions(wsConn)
-	c.JSON(http.StatusOK, gin.H{"message": "Instrument added successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": "Instruments added successfully"})
 }
 
 func updateWebSocketSubscriptions(conn *websocket.Conn) {
