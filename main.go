@@ -39,8 +39,9 @@ var (
 			return true
 		},
 	}
-
+	clientCount        int
 	hub                *Hub // Central hub for WebSocket connections
+	hubMu              sync.Mutex
 	ipConnections      map[string]int
 	channelSubscribers map[string]int
 )
@@ -101,7 +102,7 @@ func main() {
 	}
 	fmt.Println("Connected to Redis")
 	r := gin.Default()
-	r.Use(RateLimitMiddleware(10))
+	r.Use(RateLimitMiddleware(300))
 	InitializeRedis()
 	// Create a group for /websocket
 	wsGroup := r.Group("/websocket")
@@ -111,7 +112,7 @@ func main() {
 		c.JSON(http.StatusOK, "Hello World")
 	})
 
-	wsGroup.POST("/addInstrument/:token", func(ctx *gin.Context) {
+	wsGroup.POST("/addInstrument", func(ctx *gin.Context) {
 		addInstruments(ctx)
 	})
 
@@ -125,6 +126,10 @@ func main() {
 
 	wsGroup.GET("/ws", func(ctx *gin.Context) {
 		hub.handleConnection(ctx)
+	})
+
+	wsGroup.POST("/quotes", func(ctx *gin.Context) {
+		Ltp(ctx)
 	})
 
 	wsGroup.GET("/getInstruments", getInstruments)
@@ -161,6 +166,7 @@ type Hub struct {
 	register          chan *Client
 	unregister        chan *Client
 	userSubscriptions map[*Client]map[string]bool
+	subscribersMutex  sync.Mutex
 	mu                sync.Mutex
 }
 
@@ -171,6 +177,7 @@ func NewHub() *Hub {
 		register:          make(chan *Client),
 		unregister:        make(chan *Client),
 		userSubscriptions: make(map[*Client]map[string]bool),
+		subscribersMutex:  sync.Mutex{},
 	}
 }
 
@@ -178,7 +185,11 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
+			hubMu.Lock()
 			h.clients[client] = true
+			clientCount++
+			fmt.Println("`````````````````````````Connection count:`````````````````````````", clientCount)
+			hubMu.Unlock()
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {
 				for channel := range client.subscriptions {
@@ -200,7 +211,8 @@ func (h *Hub) Run() {
 
 				// Decrement the connection count for the client's IP address
 				ipConnections[client.ip]--
-
+				clientCount--
+				fmt.Println("``````````````````Connection count ``````````````````", clientCount)
 				// Ensure the count does not go below zero
 				if ipConnections[client.ip] < 0 {
 					ipConnections[client.ip] = 0
@@ -220,17 +232,16 @@ func (h *Hub) Run() {
 }
 
 func (h *Hub) handleConnection(c *gin.Context) {
-	// Read and verify the PASETO token from the request header
+	fmt.Println("Connecting...")
+
 	token := c.Query("token")
 	if token == "" {
-		// If the token is missing, return an unauthorized response with an error message
 		fmt.Println("Missing token")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing token"})
 		return
 	}
-	// Verify the PASETO token
+
 	if err := verifyPasetoToken(token); err != nil {
-		// If the token is invalid, return an unauthorized response with an error message
 		fmt.Println("Invalid token ", err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 		return
@@ -277,45 +288,49 @@ func (c *Client) readPump() {
 		hub.unregister <- c
 		c.conn.Close()
 	}()
+
 	c.conn.SetReadLimit(1024)
 	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
+
 	for {
 		messageType, p, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			switch {
+			case websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure):
 				fmt.Printf("Unexpected close error: %v\n", err)
-			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure) {
+			case websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure):
 				fmt.Printf("Normal close error: %v\n", err)
-			} else {
+			default:
 				fmt.Printf("WebSocket read error: %v\n", err)
 			}
 			break
 		}
 
-		if messageType == websocket.TextMessage {
+		switch messageType {
+		case websocket.TextMessage:
 			var messageData map[string]interface{}
-			if err := json.Unmarshal(p, &messageData); err != nil {
+			err := json.Unmarshal(p, &messageData)
+			if err != nil {
 				fmt.Println("Error parsing JSON message:", err)
 			} else {
-				message, ok := messageData["type"].(string)
-				if ok {
-					if message == "subscribe" {
+				if message, ok := messageData["type"].(string); ok {
+					switch message {
+					case "subscribe":
 						c.handleSubscribe(messageData)
-					} else if message == "update" {
+					case "update":
 						c.handleUpdate(messageData)
-					} else {
-						// Discard other message types
+					default:
 						fmt.Println("Discarding unknown message type:", message)
 					}
 				} else {
 					fmt.Println("Message type is missing in the JSON data")
 				}
 			}
-		} else if messageType == websocket.PongMessage {
+		case websocket.PongMessage:
 			fmt.Println("Pong received, connection is alive")
 		}
 	}
@@ -338,60 +353,53 @@ func (c *Client) handleUpdate(messageData map[string]interface{}) {
 	if !ok {
 		return
 	}
+
 	channelName, ok := channel.(string)
 	if !ok {
-		fmt.Println("Invalid channel name")
+		log.Println("Invalid channel name")
 		return
 	}
+
 	c.subscriptions[channelName] = true
 	hub.addSubscription(c, channelName)
-	if wsConn == nil {
-		return
+
+	if wsConn != nil {
+		channelSubscribers[channelName]++
 	}
-	// Increment the subscriber count for the channel
-	channelSubscribers[channelName]++
 }
 
 func (c *Client) writePump() {
-	// Create a ticker that ticks every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
-
-	// Create a ticker that ticks every 5 seconds to send ping messages
-	pingTicker := time.NewTicker(5 * time.Second)
-
-	// Defer closing the connection and stopping the tickers when the function returns
 	defer func() {
-		ticker.Stop()
-		pingTicker.Stop()
-		c.conn.Close()
+		if c.conn != nil {
+			c.conn.Close()
+		}
 	}()
 
-	// Infinite loop to continuously handle messages and ping messages
+	sendTicker := time.NewTicker(1 * time.Second)
+	defer sendTicker.Stop()
+
+	pingTicker := time.NewTicker(10 * time.Second)
+	defer pingTicker.Stop()
+
 	for {
 		select {
 		case message, ok := <-c.send:
-			// If the channel is closed, write a close message to the connection and return
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			// Set a write deadline of 10 seconds
 			c.conn.SetWriteDeadline(time.Now().Add(4 * time.Second))
-
-			// Write the message to the connection
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 
-		case <-ticker.C:
-			// Write a ping control message to the connection to check the connection status
+		case <-sendTicker.C:
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
 				return
 			}
 
 		case <-pingTicker.C:
-			// Write a ping control message to the connection to check the connection status
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
 				return
 			}
@@ -445,11 +453,12 @@ func (c *Client) subscribe(channelName string) {
 		fmt.Println("Error checking membership:", err)
 		return
 	}
-	fmt.Println("isMember:", isMember)
 	if !isMember {
 		fmt.Printf("Not allowed to subscribe to channel: %s\n", channelName)
 		return
 	}
+	// hub.subscribersMutex.Lock()
+	// defer hub.subscribersMutex.Unlock()
 	if c.subscriptions[channelName] {
 		fmt.Printf("Client is already subscribed to channel: %s\n", channelName)
 		return
@@ -473,31 +482,31 @@ func (c *Client) subscribe(channelName string) {
 }
 
 func (h *Hub) addSubscription(client *Client, channelName string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	if _, ok := h.userSubscriptions[client]; !ok {
 		h.userSubscriptions[client] = make(map[string]bool)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	clientSubscriptions, ok := h.userSubscriptions[client]
-	if !ok {
-		clientSubscriptions = make(map[string]bool)
-		h.userSubscriptions[client] = clientSubscriptions
-	}
-	clientSubscriptions[channelName] = true
+
+	h.userSubscriptions[client][channelName] = true
 }
 
 func (h *Hub) removeSubscription(client *Client, channelName string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.userSubscriptions[client], channelName)
-	if len(h.userSubscriptions[client]) == 0 {
-		delete(h.userSubscriptions, client)
+	if subs, ok := h.userSubscriptions[client]; ok {
+		delete(subs, channelName)
+		if len(subs) == 0 {
+			delete(h.userSubscriptions, client)
+		}
 	}
 }
 
 func RateLimitMiddleware(limit int) gin.HandlerFunc {
 	// Create a map to track the last reset time for each IP
-	ipLastReset := make(map[string]time.Time)
+	ipLastReset := sync.Map{}
+	ipConnections := sync.Map{}
 
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
@@ -506,25 +515,28 @@ func RateLimitMiddleware(limit int) gin.HandlerFunc {
 		}
 
 		// Check if it's time to reset the connection count for this IP
-		lastReset, ok := ipLastReset[ip]
-		if !ok || time.Since(lastReset).Seconds() >= resetInterval {
+		lastReset, ok := ipLastReset.Load(ip)
+		if !ok || time.Since(lastReset.(time.Time)).Seconds() >= resetInterval {
 			// Reset the connection count and update the last reset time
-			ipConnections[ip] = 0
-			ipLastReset[ip] = time.Now()
+			ipConnections.Store(ip, 0)
+			ipLastReset.Store(ip, time.Now())
 		}
 
-		count := ipConnections[ip]
+		countValue, _ := ipConnections.LoadOrStore(ip, 0)
+		count := countValue.(int)
 
 		if count >= limit {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
 			c.Abort()
 			return
 		}
-		ipConnections[ip]++
+
+		ipConnections.Store(ip, count+1)
+
 		defer func() {
-			// Decrement the connection count when the WebSocket connection closes
-			ipConnections[ip]--
+			ipConnections.Store(ip, count-1)
 		}()
+
 		c.Next()
 	}
 }
@@ -583,15 +595,23 @@ func InitializeRedis() {
 }
 
 func handleRedisMessage(channel, message string) {
+	clientsToDelete := []*Client{} // Create a temporary slice to store clients to delete
+
+	// Iterate over the userSubscriptions map
 	for client := range hub.userSubscriptions {
 		if client.subscriptions[channel] {
 			select {
 			case client.send <- []byte(message):
 			default:
 				close(client.send)
-				delete(hub.clients, client)
+				clientsToDelete = append(clientsToDelete, client) // Add client to the slice for deletion
 			}
 		}
+	}
+
+	// Delete the clients outside of the loop
+	for _, client := range clientsToDelete {
+		delete(hub.clients, client)
 	}
 }
 
@@ -614,7 +634,7 @@ func getInstruments(c *gin.Context) {
 
 func addInstruments(c *gin.Context) {
 	var request struct {
-		Tokens []int `json:"tokens", binding`
+		Tokens []int `json:"tokens" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&request); err != nil {
@@ -746,12 +766,15 @@ func updateTokenAndKey(ctx *gin.Context) {
 	go connectToWebSocket()
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "Token and Key updated successfully"})
+	fmt.Println("Token and Key updated successfully")
 	return
 }
 
 func connectToWebSocket() *websocket.Conn {
+	fmt.Println("Connecting to WebSocket...")
 	terminate := make(chan struct{})
 	ctx := context.Background()
+
 	// Get the token and key from Redis
 	token, err := redisClient.Get(ctx, "zerodha:token").Result()
 	if err != nil {
@@ -777,10 +800,7 @@ func connectToWebSocket() *websocket.Conn {
 	}
 
 	// Initialize WebSocket connection with the retrieved key and token
-	wsURL = fmt.Sprintf("wss://ws.kite.trade?api_key=%s&access_token=%s", key, token)
-
-	websocketMu.Lock()
-	defer websocketMu.Unlock()
+	wsURL := fmt.Sprintf("wss://ws.kite.trade?api_key=%s&access_token=%s", key, token)
 
 	// If a WebSocket connection already exists, update it with the new URL
 	if wsConn != nil {
@@ -789,76 +809,61 @@ func connectToWebSocket() *websocket.Conn {
 			log.Println("Failed to close existing WebSocket connection:", err)
 			return nil
 		}
-
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-		if err != nil {
-			log.Println("WebSocket connection failed: ", err)
-			return nil
-		}
-
-		wsConn = conn
-		return conn
 	}
 
-	for {
-		select {
-		case <-terminate:
-			return nil // Terminate the goroutine if termination signal is received
-		default:
-			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		log.Println("WebSocket connection failed: ", err)
+		return nil
+	}
+
+	wsConn = conn
+
+	go func() {
+		<-terminate // Terminate the goroutine if termination signal is received
+		conn.Close()
+	}()
+
+	instrumentTokens := getInstrumentTokensFromRedis()
+	subscribeToInstruments(conn, instrumentTokens)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			messageType, p, err := conn.ReadMessage()
 			if err != nil {
-				_, file, line, _ := runtime.Caller(0) // Get caller info
-				err1 := db.InsertError("Failed to connect to WebSocket: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-				if err1 != nil {
-					fmt.Println(err1)
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
+					log.Println("WebSocket connection closed gracefully.")
+				} else {
+					log.Println("WebSocket read error: ", err)
 				}
-				log.Println("WebSocket connection failed: ", err)
-				return nil
+				break
 			}
-
-			// Lock the mutex to update the global WebSocket connection
-			wsConnMutex.Lock()
-			wsConn = conn
-			wsConnMutex.Unlock()
-
-			instrumentTokens := getInstrumentTokensFromRedis()
-			subscribeToInstruments(conn, instrumentTokens)
-
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					messageType, p, err := conn.ReadMessage()
-					if err != nil {
-						if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
-							log.Println("WebSocket connection closed gracefully.")
-						} else {
-							log.Println("WebSocket read error: ", err)
-						}
-						break
-					}
-
-					if messageType == websocket.BinaryMessage {
-						handleQuoteData(p)
-					}
-				}
-			}()
-
-			go func() {
-				signalCh := make(chan os.Signal, 1)
-				signal.Notify(signalCh, os.Interrupt)
-				<-signalCh
-				log.Println("Received termination signal. Closing WebSocket and exiting.")
-				conn.Close()
-
-				// Send a signal to terminate this goroutine
-				os.Exit(0)
-			}()
-
-			wg.Wait()
+			if messageType == websocket.PongMessage {
+				continue
+			}
+			if messageType == websocket.BinaryMessage {
+				handleQuoteData(p)
+			}
 		}
-	}
+	}()
+
+	go func() {
+		signalCh := make(chan os.Signal, 1)
+		signal.Notify(signalCh, os.Interrupt)
+		<-signalCh
+		log.Println("Received termination signal. Closing WebSocket and exiting.")
+		conn.Close()
+
+		// Send a signal to terminate this goroutine
+		os.Exit(0)
+	}()
+
+	wg.Wait()
+
+	return conn
 }
 
 func handleQuoteData(data []byte) {
@@ -965,41 +970,125 @@ func getInstrumentTokensFromRedis() []int {
 	return tokens
 }
 
+var connMutex sync.Mutex
+
 func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 	fmt.Println("Subscribing to instruments:", instrumentTokens)
-	// subscribe
+
+	// Create a buffered channel to queue the messages
+	messageQueue := make(chan []byte, 100)
+
+	// Start a goroutine to handle the writes
+	go func() {
+		for message := range messageQueue {
+			connMutex.Lock() // Acquire the lock before writing
+			err := conn.WriteMessage(websocket.TextMessage, message)
+			connMutex.Unlock() // Release the lock after writing
+
+			if err != nil {
+				fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+				log.Println("WebSocket write error: ", err)
+				return
+			}
+		}
+	}()
+
+	// Subscribe
 	subscribeMessage := map[string]interface{}{
 		"a": "subscribe",
 		"v": instrumentTokens,
 	}
 
-	err := conn.WriteJSON(subscribeMessage)
+	// Convert the subscribeMessage to JSON byte slice
+	subscribeJSON, err := json.Marshal(subscribeMessage)
 	if err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Subscribe error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-
-		log.Fatal("Subscribe error: ", err)
-	} else {
-		log.Println("Subscribed to instruments:", instrumentTokens)
+		log.Fatal("JSON marshal error: ", err)
 	}
 
+	// Queue the message for writing
+	messageQueue <- subscribeJSON
+
+	// Set mode
 	setModeMessage := map[string]interface{}{
 		"a": "mode",
 		"v": []interface{}{"quote", instrumentTokens},
 	}
 
-	err = conn.WriteJSON(setModeMessage)
+	// Convert the setModeMessage to JSON byte slice
+	setModeJSON, err := json.Marshal(setModeMessage)
 	if err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Set mode error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err != nil {
-			fmt.Println(err1)
-		}
-		log.Fatal("Set mode error: ", err)
-	} else {
-		log.Println("Subscribed to the following instruments: ", instrumentTokens)
+		log.Fatal("JSON marshal error: ", err)
 	}
+
+	// Queue the message for writing
+	messageQueue <- setModeJSON
+
+	// Close the message queue to indicate that no more messages will be queued
+	close(messageQueue)
+
+	log.Println("Subscribed to the following instruments:", instrumentTokens)
+}
+
+// func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
+// 	fmt.Println("Subscribing to instruments:", instrumentTokens)
+// 	// subscribe
+// 	subscribeMessage := map[string]interface{}{
+// 		"a": "subscribe",
+// 		"v": instrumentTokens,
+// 	}
+
+// 	err := conn.WriteJSON(subscribeMessage)
+// 	if err != nil {
+// 		_, file, line, _ := runtime.Caller(0) // Get caller info
+// 		err1 := db.InsertError("Subscribe error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+// 		if err1 != nil {
+// 			fmt.Println(err1)
+// 		}
+
+// 		log.Fatal("Subscribe error: ", err)
+// 	} else {
+// 		log.Println("Subscribed to instruments:", instrumentTokens)
+// 	}
+
+// 	setModeMessage := map[string]interface{}{
+// 		"a": "mode",
+// 		"v": []interface{}{"quote", instrumentTokens},
+// 	}
+
+// 	err = conn.WriteJSON(setModeMessage)
+// 	if err != nil {
+// 		_, file, line, _ := runtime.Caller(0) // Get caller info
+// 		err1 := db.InsertError("Set mode error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+// 		if err != nil {
+// 			fmt.Println(err1)
+// 		}
+// 		log.Fatal("Set mode error: ", err)
+// 	} else {
+// 		log.Println("Subscribed to the following instruments: ", instrumentTokens)
+// 	}
+// }
+
+type LtpRequest struct {
+	Instruments []int `json:"instruments" binding:"required"`
+}
+
+func Ltp(c *gin.Context) {
+	var req LtpRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ltp, err := redisClient.Get(c, strconv.Itoa(req.Instruments[0])).Result()
+	if err == redis.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "LTP data not found for the instrument"})
+		return
+	} else if err != nil {
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching LTP data from Redis"})
+		return
+	}
+	fmt.Println("LTP:", ltp)
+	fmt.Println("Request:", req)
+	c.JSON(http.StatusOK, gin.H{"message": "Data validated successfully"})
 }
