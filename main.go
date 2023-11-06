@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 	db "websocket/database"
@@ -26,7 +26,7 @@ import (
 var (
 	redisClient *redis.Client
 	wsURL       string
-	wsConnMutex sync.Mutex
+	// wsConnMutex sync.Mutex
 	wsConn      *websocket.Conn
 	websocketMu sync.Mutex
 )
@@ -39,6 +39,7 @@ var (
 			return true
 		},
 	}
+	UserID             int32
 	clientCount        int
 	hub                *Hub // Central hub for WebSocket connections
 	hubMu              sync.Mutex
@@ -56,11 +57,7 @@ func main() {
 	hub = NewHub()
 	go hub.Run()
 	if err := godotenv.Load(); err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Error loading .env file "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
+		logError("Error loading .env file", err)
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
@@ -69,18 +66,12 @@ func main() {
 	serverAddress := os.Getenv("PORT")
 	fmt.Println("REDIS_ADDR:", redisAddr, "REDIS_DB:", redisDBStr, "SERVER_ADDRESS:", serverAddress)
 
-	// Convert the database number to an integer
 	redisDB := 1
 	if redisDBStr != "" {
 		var err error
 		redisDB, err = strconv.Atoi(redisDBStr)
 		if err != nil {
-			_, file, line, _ := runtime.Caller(0) // Get caller info
-			err1 := db.InsertError("Error parsing Redis DB number from environment "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-			if err1 != nil {
-				fmt.Println(err1)
-			}
-			fmt.Println("Invalid Redis DB number:", err)
+			logError("Error parsing Redis DB number from environment", err)
 			os.Exit(1)
 		}
 	}
@@ -92,45 +83,29 @@ func main() {
 	})
 
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Failed to connect to Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		fmt.Println("@@@@@@@@@@Failed to connect to Redis:@@@@@@@@@", err)
+		logError("Failed to connect to Redis", err)
 		os.Exit(1)
 	}
-	fmt.Println("Connected to Redis")
+
 	r := gin.Default()
 	r.Use(RateLimitMiddleware(300))
 	InitializeRedis()
-	// Create a group for /websocket
+
 	wsGroup := r.Group("/websocket")
 
-	// Define your WebSocket-related routes under the /websocket group
 	wsGroup.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, "Hello World")
 	})
 
-	wsGroup.POST("/addInstrument", func(ctx *gin.Context) {
-		addInstruments(ctx)
-	})
+	wsGroup.POST("/addInstrument", addInstruments)
 
-	wsGroup.DELETE("/removeInstrument/:token", func(ctx *gin.Context) {
-		removeInstrument(ctx)
-	})
+	wsGroup.DELETE("/removeInstrument/:token", removeInstrument)
 
-	wsGroup.POST("/updateTokenAndKey", func(ctx *gin.Context) {
-		updateTokenAndKey(ctx)
-	})
+	wsGroup.POST("/updateTokenAndKey", updateTokenAndKey)
 
-	wsGroup.GET("/ws", func(ctx *gin.Context) {
-		hub.handleConnection(ctx)
-	})
+	wsGroup.GET("/ws", hub.handleConnection)
 
-	wsGroup.POST("/quotes", func(ctx *gin.Context) {
-		Ltp(ctx)
-	})
+	wsGroup.POST("/quotes", LtpData)
 
 	wsGroup.GET("/getInstruments", getInstruments)
 
@@ -168,6 +143,7 @@ type Hub struct {
 	userSubscriptions map[*Client]map[string]bool
 	subscribersMutex  sync.Mutex
 	mu                sync.Mutex
+	lastMessage       map[string][]byte //last message
 }
 
 func NewHub() *Hub {
@@ -178,6 +154,7 @@ func NewHub() *Hub {
 		unregister:        make(chan *Client),
 		userSubscriptions: make(map[*Client]map[string]bool),
 		subscribersMutex:  sync.Mutex{},
+		lastMessage:       make(map[string][]byte),
 	}
 }
 
@@ -259,14 +236,35 @@ func (h *Hub) handleConnection(c *gin.Context) {
 		subscriptions: make(map[string]bool),
 		ip:            c.ClientIP(),
 	}
-
 	h.register <- client
 	go client.writePump()
 	client.readPump()
+	// fmt.Println("client", client.subscriptions)
+	// // last message
+	// for channel, _ := range client.subscriptions {
+	// 	if lastMessage, ok := h.lastMessage[channel]; ok {
+	// 		select {
+	// 		case client.send <- lastMessage:
+	// 			// Message sent successfully.
+	// 		default:
+	// 			// Handle the case where the client's send channel is full.
+	// 			// You can log or handle this according to your needs.
+	// 		}
+	// 	}
+	// }
+}
+
+type PasetoClaims struct {
+	UserID     int32
+	UserName   string
+	Email      string
+	Expiration time.Time
+	NotBefore  time.Time
+	IssuedAt   time.Time
 }
 
 func verifyPasetoToken(token string) error {
-	var payload map[string]interface{}
+	var payload PasetoClaims
 
 	parser := paseto.NewV2()
 
@@ -279,6 +277,9 @@ func verifyPasetoToken(token string) error {
 	if err != nil {
 		return err
 	}
+	UserID = payload.UserID
+	// Print the UserID
+	fmt.Printf("UserID: %d\n", UserID)
 	// If the token is valid, return nil
 	return nil
 }
@@ -315,7 +316,7 @@ func (c *Client) readPump() {
 			var messageData map[string]interface{}
 			err := json.Unmarshal(p, &messageData)
 			if err != nil {
-				fmt.Println("Error parsing JSON message:", err)
+				fmt.Println("Error parsing JSON message:", err.Error())
 			} else {
 				if message, ok := messageData["type"].(string); ok {
 					switch message {
@@ -346,25 +347,30 @@ func (c *Client) handleSubscribe(messageData map[string]interface{}) {
 			}
 		}
 	}
+	for channel, _ := range c.subscriptions {
+		if lastMessage, ok := hub.lastMessage[channel]; ok {
+			select {
+			case c.send <- lastMessage:
+				// Message sent successfully.
+			default:
+				// Handle the case where the client's send channel is full.
+				// You can log or handle this according to your needs.
+			}
+		}
+	}
 }
 
 func (c *Client) handleUpdate(messageData map[string]interface{}) {
-	channel, ok := messageData["channel"]
-	if !ok {
+	if channel, ok := messageData["channel"].(string); !ok {
 		return
-	}
-
-	channelName, ok := channel.(string)
-	if !ok {
-		log.Println("Invalid channel name")
-		return
-	}
-
-	c.subscriptions[channelName] = true
-	hub.addSubscription(c, channelName)
-
-	if wsConn != nil {
-		channelSubscribers[channelName]++
+	} else {
+		//add userid to channel name
+		channel = channel + ":" + strconv.Itoa(int(UserID))
+		c.subscriptions[channel] = true
+		hub.addSubscription(c, channel)
+		if wsConn != nil {
+			channelSubscribers[channel]++
+		}
 	}
 }
 
@@ -395,81 +401,54 @@ func (c *Client) writePump() {
 			}
 
 		case <-sendTicker.C:
-			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				return
+			{
+				err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
+				if err != nil {
+					return
+				}
 			}
 
 		case <-pingTicker.C:
-			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				return
+			{
+				err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
+				if err != nil {
+					return
+				}
 			}
 		}
-	}
-}
-
-func (c *Client) handleMessage(message string) {
-	// ctx := context.Background()
-	fmt.Println("message:", message)
-	message = strings.TrimSpace(message)
-	if strings.HasPrefix(message, "subscribe:[") && strings.HasSuffix(message, "]") {
-		channelsStr := message[len("subscribe:[") : len(message)-1]
-		channels := strings.Split(channelsStr, ",")
-		for _, channelName := range channels {
-			channelName = strings.TrimSpace(channelName)
-			if channelName == "" && len(channels) > 1 {
-				continue
-			}
-			c.subscribe(channelName)
-		}
-	} else {
-		parts := strings.SplitN(message, " ", 2)
-		fmt.Println("parts:", parts, len(parts))
-		if len(parts) < 0 {
-			fmt.Println("Invalid message format:", message)
-			return
-		}
-		channelName := strings.TrimSpace(parts[0])
-		c.subscriptions[channelName] = true
-		hub.addSubscription(c, channelName)
-		if wsConn == nil {
-			return
-		}
-		// Increment the subscriber count for the channel
-		channelSubscribers[channelName]++
 	}
 }
 
 func (c *Client) subscribe(channelName string) {
 	fmt.Println("Subscribe called for channel:", channelName)
 	ctx := context.Background()
-	//check in redis if instrument is present or not
+
+	// Check if instrument is present in Redis
 	isMember, err := redisClient.SIsMember(ctx, "instrumentTokens", channelName).Result()
 	if err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Error in checking instrument token in redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		fmt.Println("Error checking membership:", err)
+		logError("Error in checking instrument token in Redis", err)
 		return
 	}
 	if !isMember {
 		fmt.Printf("Not allowed to subscribe to channel: %s\n", channelName)
 		return
 	}
-	// hub.subscribersMutex.Lock()
-	// defer hub.subscribersMutex.Unlock()
+
+	// Check if already subscribed
 	if c.subscriptions[channelName] {
 		fmt.Printf("Client is already subscribed to channel: %s\n", channelName)
 		return
 	}
 	c.subscriptions[channelName] = true
 	hub.addSubscription(c, channelName)
+
 	if wsConn == nil {
 		return
 	}
+
 	// Increment the subscriber count for the channel
 	channelSubscribers[channelName]++
+
 	intChannel, err := strconv.Atoi(channelName)
 	if err != nil {
 		fmt.Println("Invalid channel number:", err)
@@ -478,24 +457,32 @@ func (c *Client) subscribe(channelName string) {
 
 	subscribeToInstruments(wsConn, []int{intChannel})
 	fmt.Printf("Client subscribed to channel: %s\n", channelName)
+}
 
+func logError(message string, err error) {
+	_, file, line, _ := runtime.Caller(1) // Get caller info
+	err1 := db.InsertError(message+": "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
+	if err1 != nil {
+		fmt.Println(err1)
+	}
+	fmt.Println("Error:", message, err)
 }
 
 func (h *Hub) addSubscription(client *Client, channelName string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	if _, ok := h.userSubscriptions[client]; !ok {
-		h.userSubscriptions[client] = make(map[string]bool)
+	subscriptions, ok := h.userSubscriptions[client]
+	if !ok {
+		subscriptions = make(map[string]bool)
+		h.userSubscriptions[client] = subscriptions
 	}
-
-	h.userSubscriptions[client][channelName] = true
+	subscriptions[channelName] = true
 }
 
 func (h *Hub) removeSubscription(client *Client, channelName string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if subs, ok := h.userSubscriptions[client]; ok {
+	if subs := h.userSubscriptions[client]; subs != nil {
 		delete(subs, channelName)
 		if len(subs) == 0 {
 			delete(h.userSubscriptions, client)
@@ -542,74 +529,57 @@ func RateLimitMiddleware(limit int) gin.HandlerFunc {
 }
 
 func InitializeRedis() {
-	c := context.Background()
-	// Create a channel to receive subscription messages
-	subscriptionChannel := make(chan *redis.Message)
+	ctx := context.Background()
+	subChannel := make(chan *redis.Message)
 
-	// Start a goroutine to handle incoming messages from Redis
 	go func() {
 		if redisClient == nil {
 			return
 		}
-		// Subscribe to all channels dynamically
-		pubsub := redisClient.PSubscribe(c, "*")
-		// if pubsub != nil {
-		// 	fmt.Println("Failed to subscribe to Redis channels:")
-		// 	return
-		// }
-
+		pubsub := redisClient.PSubscribe(ctx, "*")
 		if pubsub == nil {
-			fmt.Println("Failed to subscribe to Redis channels:")
+			log.Println("Failed to subscribe to Redis channels")
 			return
 		}
 
-		// Wait for a confirmation that we are subscribed
-		_, err := pubsub.Receive(c)
+		_, err := pubsub.Receive(ctx)
 		if err != nil {
-			fmt.Println("Failed to subscribe to Redis channels")
+			log.Println("Failed to subscribe to Redis channels")
 			return
 		}
 
-		// Start a goroutine to read subscription messages
 		go func() {
-			for {
-				msg, err := pubsub.ReceiveMessage(c)
-				if err != nil {
-					fmt.Println("Error receiving message from Redis:", err)
-					continue
+			for msg := range pubsub.Channel() {
+				subChannel <- &redis.Message{
+					Channel: msg.Channel,
+					Payload: msg.Payload,
 				}
-
-				// Send the subscription message to the channel
-				subscriptionChannel <- msg
 			}
 		}()
 
-		for {
-			select {
-			case msg := <-subscriptionChannel:
-				// Handle the received message from Redis
-				handleRedisMessage(msg.Channel, msg.Payload)
-			}
+		for msg := range subChannel {
+			handleRedisMessage(msg.Channel, msg.Payload)
 		}
 	}()
 }
 
 func handleRedisMessage(channel, message string) {
-	clientsToDelete := []*Client{} // Create a temporary slice to store clients to delete
+	// Store the last message for the channel
+	hub.lastMessage[channel] = []byte(message)
 
-	// Iterate over the userSubscriptions map
+	clientsToDelete := make([]*Client, 0)
+
 	for client := range hub.userSubscriptions {
 		if client.subscriptions[channel] {
 			select {
 			case client.send <- []byte(message):
 			default:
 				close(client.send)
-				clientsToDelete = append(clientsToDelete, client) // Add client to the slice for deletion
+				clientsToDelete = append(clientsToDelete, client)
 			}
 		}
 	}
 
-	// Delete the clients outside of the loop
 	for _, client := range clientsToDelete {
 		delete(hub.clients, client)
 	}
@@ -620,12 +590,7 @@ func handleRedisMessage(channel, message string) {
 func getInstruments(c *gin.Context) {
 	instrumentTokens := getInstrumentTokensFromRedis()
 	if instrumentTokens == nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		log.Println("Failed to get instrument tokens from Redis")
+		logError("Failed to get instrument tokens from Redis", errors.New("failed to get instrument tokens from Redis"))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get instrument tokens from Redis"})
 		return
 	}
@@ -641,14 +606,19 @@ func addInstruments(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
 		return
 	}
+
+	redisPipeline := redisClient.Pipeline()
 	ctx := context.Background()
 
 	for _, token := range request.Tokens {
-		if err := redisClient.SAdd(ctx, "instrumentTokens", token).Err(); err != nil {
-			log.Println("Failed to add instrument token to Redis:", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add instruments"})
-			return
-		}
+		redisPipeline.SAdd(ctx, "instrumentTokens", token)
+	}
+
+	_, err := redisPipeline.Exec(ctx)
+	if err != nil {
+		log.Println("Failed to add instrument tokens to Redis:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add instruments"})
+		return
 	}
 
 	if wsConn == nil {
@@ -663,12 +633,7 @@ func addInstruments(c *gin.Context) {
 func updateWebSocketSubscriptions(conn *websocket.Conn) {
 	instrumentTokens := getInstrumentTokensFromRedis()
 	if instrumentTokens == nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Failed to get instrument tokens from Redis ", "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		log.Println("Failed to get instrument tokens from Redis")
+		logError("Failed to get instrument tokens from Redis", errors.New("Failed to get instrument tokens from Redis"))
 		return
 	}
 	subscribeToInstruments(conn, instrumentTokens)
@@ -690,14 +655,7 @@ func removeInstrument(c *gin.Context) {
 
 	ctx := context.Background()
 	if err := redisClient.SRem(ctx, "instrumentTokens", token).Err(); err != nil {
-
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Failed to remove instrument token from Redis "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-
-		log.Println("Failed to remove instrument token from Redis:", err)
+		logError("Failed to remove instrument token from Redis", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove instrument"})
 		return
 	}
@@ -713,15 +671,10 @@ func unsubscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 		"v": instrumentTokens,
 	}
 
-	if wsConn != nil {
-		err := wsConn.WriteJSON(setModeMessage)
+	if conn != nil {
+		err := conn.WriteJSON(setModeMessage)
 		if err != nil {
-			_, file, line, _ := runtime.Caller(0) // Get caller info
-			err1 := db.InsertError("Failed to unsubscribe to instruments "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-			if err1 != nil {
-				fmt.Println(err1)
-			}
-			log.Println("Unsubscribe error:", err)
+			logError("Failed to unsubscribe to instrument tokens", err)
 		} else {
 			log.Printf("Unsubscribed from instrument: %v\n", instrumentTokens)
 		}
@@ -730,44 +683,34 @@ func unsubscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 
 func updateTokenAndKey(ctx *gin.Context) {
 	fmt.Println("Updating token and key...")
-	var requestBody struct {
+	type RequestBody struct {
 		Token string `json:"token"`
 		Key   string `json:"key"`
 	}
+
+	var requestBody RequestBody
 	if err := ctx.ShouldBindJSON(&requestBody); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
 	if requestBody.Token == "" || requestBody.Key == "" {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Token and key cannot be empty"})
 		return
 	}
 	// Save the token and key to Redis
-	err := redisClient.Set(ctx, "zerodha:token", requestBody.Token, 0).Err()
-	if err != nil {
+	if err := redisClient.Set(ctx, "zerodha:token", requestBody.Token, 0).Err(); err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save token to Redis"})
 		return
 	}
 
-	err = redisClient.Set(ctx, "zerodha:key", requestBody.Key, 0).Err()
-	if err != nil {
+	if err := redisClient.Set(ctx, "zerodha:key", requestBody.Key, 0).Err(); err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save key to Redis"})
 		return
 	}
-	// wsURL := fmt.Sprintf("wss://ws.kite.trade?api_key=%s&access_token=%s", requestBody.Key, requestBody.Token)
-	// Update the WebSocket URL with the new token and key
-
-	// // Check if the WebSocket connection is already established
-	// if wsConn != nil {
-	// 	wsConn.Close() // Close the existing connection
-	// }
-
-	// connectToWebSocket(wsURL) // Create a new WebSocket connection with the updated URL
 	go connectToWebSocket()
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "Token and Key updated successfully"})
-	fmt.Println("Token and Key updated successfully")
-	return
 }
 
 func connectToWebSocket() *websocket.Conn {
@@ -778,12 +721,7 @@ func connectToWebSocket() *websocket.Conn {
 	// Get the token and key from Redis
 	token, err := redisClient.Get(ctx, "zerodha:token").Result()
 	if err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Failed to get token for zerodha from Redis: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		fmt.Println("Failed to get token from Redis:", err)
+		logError("Failed to get token from Redis", err)
 		return nil
 	}
 
@@ -800,7 +738,7 @@ func connectToWebSocket() *websocket.Conn {
 	}
 
 	// Initialize WebSocket connection with the retrieved key and token
-	wsURL := fmt.Sprintf("wss://ws.kite.trade?api_key=%s&access_token=%s", key, token)
+	wsURL = fmt.Sprintf("wss://ws.kite.trade?api_key=%s&access_token=%s", key, token)
 
 	// If a WebSocket connection already exists, update it with the new URL
 	if wsConn != nil {
@@ -870,36 +808,25 @@ func handleQuoteData(data []byte) {
 	if data == nil {
 		return
 	}
+	quotes := parseQuoteData(data)
 
-	quoteDataList := parseQuoteData(data)
-
-	for _, quoteData := range quoteDataList {
-		publishToRedis(quoteData)
+	for _, quote := range quotes {
+		publishToRedis(quote)
 	}
 }
 
 func publishToRedis(quoteData QuoteData) {
 	jsonData, err := json.Marshal(quoteData)
 	if err != nil {
-		log.Println("JSON marshaling error: ", err)
+		log.Println("JSON marshaling error:", err)
 		return
 	}
 
 	channelName := strconv.FormatUint(uint64(quoteData.Token), 10)
-
-	ctx := context.Background()
-	err = redisClient.Publish(ctx, channelName, jsonData).Err()
-	if err != nil {
-		_, file, line, _ := runtime.Caller(0) // Get caller info
-		err1 := db.InsertError("Redis publish error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-		if err1 != nil {
-			fmt.Println(err1)
-		}
-		log.Println("Redis publish error: ", err)
+	if err := redisClient.Publish(context.Background(), channelName, jsonData).Err(); err != nil {
+		logError("Failed to publish data to Redis", err)
 		return
 	}
-
-	// log.Printf("Published data to Redis channel %s: %s\n", channelName, jsonData)
 }
 
 type QuoteData struct {
@@ -919,47 +846,50 @@ func parseQuoteData(data []byte) []QuoteData {
 		return quoteDataList
 	}
 
-	pktLen := binary.BigEndian.Uint16(data[0:2])
+	pktLen := binary.BigEndian.Uint16(data[:2])
 
 	j := 2
 	for i := 0; i < int(pktLen); i++ {
 		pLen := binary.BigEndian.Uint16(data[j : j+2])
 		pkts = append(pkts, data[j+2:j+2+int(pLen)])
 
-		j = j + 2 + int(pLen)
+		j += 2 + int(pLen)
 	}
 
 	for _, pktData := range pkts {
-		var quoteData QuoteData
-		if len(pktData) >= 44 {
-			quoteData.Token = binary.BigEndian.Uint32(pktData[0:4])
-			quoteData.LTP = float32(binary.BigEndian.Uint32(pktData[4:8])) / 100
-			quoteData.H = float32(binary.BigEndian.Uint32(pktData[32:36])) / 100
-			quoteData.L = float32(binary.BigEndian.Uint32(pktData[36:40])) / 100
-			quoteData.C = float32(binary.BigEndian.Uint32(pktData[40:44])) / 100
-			quoteData.O = float32(binary.BigEndian.Uint32(pktData[28:32])) / 100
-			quoteData.V = binary.BigEndian.Uint32(pktData[16:20])
-
-			quoteDataList = append(quoteDataList, quoteData)
+		if len(pktData) < 44 {
+			continue
 		}
+
+		quoteData := QuoteData{
+			Token: binary.BigEndian.Uint32(pktData[:4]),
+			LTP:   float32(binary.BigEndian.Uint32(pktData[4:8])) / 100,
+			H:     float32(binary.BigEndian.Uint32(pktData[32:36])) / 100,
+			L:     float32(binary.BigEndian.Uint32(pktData[36:40])) / 100,
+			C:     float32(binary.BigEndian.Uint32(pktData[40:44])) / 100,
+			O:     float32(binary.BigEndian.Uint32(pktData[28:32])) / 100,
+			V:     binary.BigEndian.Uint32(pktData[16:20]),
+		}
+
+		quoteDataList = append(quoteDataList, quoteData)
 	}
+
 	return quoteDataList
 }
 
 func getInstrumentTokensFromRedis() []int {
-	ctx := context.Background()
 	if redisClient == nil {
 		return []int{}
 	}
+
+	ctx := context.Background()
 	tokenStrs, err := redisClient.SMembers(ctx, "instrumentTokens").Result()
 	if err != nil {
 		log.Println("Failed to get instrument tokens from Redis:", err)
 		return []int{}
 	}
-	if len(tokenStrs) == 0 {
-		return []int{}
-	}
-	var tokens []int
+
+	tokens := make([]int, 0, len(tokenStrs))
 	for _, tokenStr := range tokenStrs {
 		token, err := strconv.Atoi(tokenStr)
 		if err == nil {
@@ -1029,66 +959,45 @@ func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
 	log.Println("Subscribed to the following instruments:", instrumentTokens)
 }
 
-// func subscribeToInstruments(conn *websocket.Conn, instrumentTokens []int) {
-// 	fmt.Println("Subscribing to instruments:", instrumentTokens)
-// 	// subscribe
-// 	subscribeMessage := map[string]interface{}{
-// 		"a": "subscribe",
-// 		"v": instrumentTokens,
-// 	}
-
-// 	err := conn.WriteJSON(subscribeMessage)
-// 	if err != nil {
-// 		_, file, line, _ := runtime.Caller(0) // Get caller info
-// 		err1 := db.InsertError("Subscribe error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-// 		if err1 != nil {
-// 			fmt.Println(err1)
-// 		}
-
-// 		log.Fatal("Subscribe error: ", err)
-// 	} else {
-// 		log.Println("Subscribed to instruments:", instrumentTokens)
-// 	}
-
-// 	setModeMessage := map[string]interface{}{
-// 		"a": "mode",
-// 		"v": []interface{}{"quote", instrumentTokens},
-// 	}
-
-// 	err = conn.WriteJSON(setModeMessage)
-// 	if err != nil {
-// 		_, file, line, _ := runtime.Caller(0) // Get caller info
-// 		err1 := db.InsertError("Set mode error: "+err.Error(), "websocket", "", file+":"+strconv.Itoa(line), nil)
-// 		if err != nil {
-// 			fmt.Println(err1)
-// 		}
-// 		log.Fatal("Set mode error: ", err)
-// 	} else {
-// 		log.Println("Subscribed to the following instruments: ", instrumentTokens)
-// 	}
-// }
-
 type LtpRequest struct {
 	Instruments []int `json:"instruments" binding:"required"`
 }
 
-func Ltp(c *gin.Context) {
+func LtpData(c *gin.Context) {
 	var req LtpRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	ltp, err := redisClient.Get(c, strconv.Itoa(req.Instruments[0])).Result()
-	if err == redis.Nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "LTP data not found for the instrument"})
-		return
-	} else if err != nil {
 
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching LTP data from Redis"})
-		return
+	ltpData := make(map[int]float32, len(req.Instruments))
+
+	for _, instrument := range req.Instruments {
+		channelName := strconv.Itoa(instrument)
+		msg, err := redisClient.Subscribe(c, channelName).ReceiveMessage(c)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": err.Error()})
+			return
+		}
+
+		var quote QuoteData
+		if err := json.Unmarshal([]byte(msg.Payload), &quote); err != nil {
+			fmt.Println("Error unmarshaling JSON:", err)
+			return
+		}
+
+		ltpData[instrument] = quote.LTP
 	}
-	fmt.Println("LTP:", ltp)
+
+	response := gin.H{
+		"Data":   ltpData,
+		"status": "success",
+		"error":  nil,
+	}
+
+	fmt.Println("LTP Data:", ltpData)
 	fmt.Println("Request:", req)
-	c.JSON(http.StatusOK, gin.H{"message": "Data validated successfully"})
+
+	c.JSON(http.StatusOK, response)
 }
